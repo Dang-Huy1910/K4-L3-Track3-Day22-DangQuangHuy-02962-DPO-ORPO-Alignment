@@ -30,7 +30,10 @@ from pathlib import Path
 ROOT = next(p for p in (Path.cwd(), *Path.cwd().parents) if (p / "lab22" / "config.py").exists())
 sys.path.insert(0, str(ROOT))
 
-import unsloth  # noqa: F401
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
 import torch
 
 from lab22 import config as C
@@ -41,7 +44,8 @@ from lab22 import modeling as MD
 # Relative overrides (e.g. from `make beta-sweep`) resolve against the repo, not the cwd.
 _override = Path(os.environ.get("DPO_ADAPTER_OVERRIDE", C.DPO_ADAPTER))
 DPO_ADAPTER = _override if _override.is_absolute() else C.REPO_ROOT / _override
-assert torch.cuda.is_available()
+if not torch.cuda.is_available():
+    print("WARNING: CUDA unavailable. Generation and judging will run on CPU.")
 assert C.SFT_MERGED.exists() and DPO_ADAPTER.exists(), "Run NB1 + NB3 first"
 mismatch = D.split_mismatch(C.PREF_DIR, DPO_ADAPTER)
 assert mismatch is None, mismatch

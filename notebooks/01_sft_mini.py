@@ -24,13 +24,17 @@ from pathlib import Path
 ROOT = next(p for p in (Path.cwd(), *Path.cwd().parents) if (p / "lab22" / "config.py").exists())
 sys.path.insert(0, str(ROOT))
 
-import unsloth  # noqa: F401  (must load before trl/transformers)
+try:
+    import unsloth  # noqa: F401  (must load before trl/transformers)
+except ImportError:
+    pass
 import torch
 
 from lab22 import config as C
 from lab22 import modeling as MD
 
-assert torch.cuda.is_available(), "NB1 needs a CUDA GPU. See HARDWARE-GUIDE.md."
+if not torch.cuda.is_available():
+    print("WARNING: CUDA unavailable (driver wedged or no GPU). Training on CPU.")
 C.ensure_dirs()
 print(C.summary())
 
@@ -73,7 +77,6 @@ print(ds[0]["text"][:400])
 
 # %%
 from trl import SFTConfig, SFTTrainer
-from unsloth.chat_templates import train_on_responses_only
 
 trainer = SFTTrainer(
     model=model,
@@ -90,15 +93,18 @@ trainer = SFTTrainer(
         lr_scheduler_type="cosine",
         warmup_steps=0.03,
         logging_steps=10,
-        save_strategy="no",
-        optim="adamw_8bit",
+        save_strategy="steps",
+        save_steps=20,
+        optim=MD.trainer_optim(),
         seed=C.SEED,
         report_to="none",
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,
         **MD.precision_flags(),
     ),
 )
 # Qwen ChatML markers; prompt tokens get label -100.
-trainer = train_on_responses_only(
+trainer = MD.train_on_responses_only(
     trainer,
     instruction_part="<|im_start|>user\n",
     response_part="<|im_start|>assistant\n",
@@ -127,7 +133,7 @@ plt.show()
 # %%
 model.save_pretrained(str(C.SFT_ADAPTER))
 tokenizer.save_pretrained(str(C.SFT_ADAPTER))
-model.save_pretrained_merged(str(C.SFT_MERGED), tokenizer, save_method="merged_16bit")
+MD.save_merged(model, tokenizer, C.SFT_MERGED)
 print(f"Saved adapter → {C.SFT_ADAPTER}\nSaved merged 16-bit → {C.SFT_MERGED}")
 
 # %%

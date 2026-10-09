@@ -28,14 +28,18 @@ from pathlib import Path
 ROOT = next(p for p in (Path.cwd(), *Path.cwd().parents) if (p / "lab22" / "config.py").exists())
 sys.path.insert(0, str(ROOT))
 
-import unsloth  # noqa: F401
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
 import torch
 
 from lab22 import config as C
 from lab22 import data as D
 from lab22 import modeling as MD
 
-assert torch.cuda.is_available(), "DPO needs a CUDA GPU. See HARDWARE-GUIDE.md."
+if not torch.cuda.is_available():
+    print("WARNING: CUDA unavailable. DPO will run on CPU.")
 assert C.SFT_MERGED.exists(), f"Run NB1 first: {C.SFT_MERGED} missing"
 assert (C.PREF_DIR / "train.parquet").exists(), "Run NB2 first"
 C.ensure_dirs()

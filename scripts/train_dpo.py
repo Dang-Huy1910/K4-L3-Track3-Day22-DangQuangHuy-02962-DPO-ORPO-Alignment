@@ -27,7 +27,10 @@ def main() -> int:
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
-    import unsloth  # noqa: F401  (patch trl/transformers first)
+    try:
+        import unsloth  # noqa: F401  (patch trl/transformers first)
+    except ImportError:
+        pass
     from datasets import Dataset
     from trl import DPOTrainer
 

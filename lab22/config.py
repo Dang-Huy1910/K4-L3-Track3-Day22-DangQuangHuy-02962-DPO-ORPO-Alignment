@@ -109,11 +109,16 @@ TIER = _TIERS[COMPUTE_TIER]
 BASE_MODEL = _env("BASE_MODEL", TIER.base_model)
 MAX_LEN = int(_env("MAX_LEN", str(TIER.max_len)))
 SEED = int(_env("SEED", "42"))
+# 1 = bitsandbytes 4-bit (T4/4B). 0 = fp16, needed to merge LoRA on a 4 GB card
+# when BASE_MODEL is a 0.5B–0.6B instruct checkpoint.
+LOAD_IN_4BIT = _env("LOAD_IN_4BIT", "1").strip().lower() not in ("0", "false", "no")
 
 # Qwen3 hybrid checkpoints (the BigGPU 8B) think by default. The lab compares
 # final answers, so thinking is switched off everywhere a chat template is
-# rendered. The 2507 instruct template ignores the flag.
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+# rendered. The 2507 instruct template ignores the flag. Smaller Qwen2.5
+# templates reject unknown kwargs such as enable_thinking.
+_qwen3_thinking = "Qwen3" in BASE_MODEL and "Instruct-2507" not in BASE_MODEL
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False} if _qwen3_thinking else {}
 
 # --- Data -----------------------------------------------------------------
 SFT_DATASET = _env("SFT_DATASET", "saillab/alpaca-vietnamese-cleaned")
