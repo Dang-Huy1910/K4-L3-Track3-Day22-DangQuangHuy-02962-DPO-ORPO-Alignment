@@ -281,25 +281,60 @@ def sanity_accuracy(score: Scorer) -> float:
     return sum(score(p, good) > score(p, bad) for p, good, bad in SANITY_PAIRS) / len(SANITY_PAIRS)
 
 
-def make_rm_scorer(name: str | Path, max_length: int = 4096) -> Scorer:
-    """Load a sequence-classification reward model (e.g. Skywork-Reward-V2) on the GPU."""
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16  # T4: fp16
-    tok = AutoTokenizer.from_pretrained(name)
-    rm = AutoModelForSequenceClassification.from_pretrained(
-        name, dtype=dtype, device_map="cuda:0", attn_implementation="sdpa", num_labels=1
-    ).eval()
-
-    def score(prompt: str, answer: str) -> float:
-        conv = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
+def _rm_conversation_text(tok, prompt: str, answer: str) -> str:
+    conv = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
+    if getattr(tok, "chat_template", None):
         text = tok.apply_chat_template(conv, tokenize=False)
         if tok.bos_token and text.startswith(tok.bos_token):
-            text = text[len(tok.bos_token):]  # the tokenizer adds it again
-        batch = tok(text, return_tensors="pt", truncation=True, max_length=max_length).to(rm.device)
+            text = text[len(tok.bos_token) :]  # the tokenizer adds it again
+        return text
+    return f"User: {prompt}\nAssistant: {answer}"
+
+
+def make_rm_scorer(name: str | Path, max_length: int = 4096) -> Scorer:
+    """Load a sequence-classification reward model (e.g. Skywork-Reward-V2).
+
+    Uses GPU fp16 when it fits; 4-bit or CPU otherwise so a 4 GB card can still
+    run a smaller RM (Skywork 4B/3B fp16 need ~8 GB).
+    """
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, BitsAndBytesConfig
+
+    tok = AutoTokenizer.from_pretrained(name)
+    attempts: list[dict] = []
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        attempts.append({"dtype": dtype, "device_map": "cuda:0", "num_labels": 1})
+        attempts.append({
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            ),
+            "device_map": "auto",
+            "num_labels": 1,
+        })
+    attempts.append({"torch_dtype": torch.float32, "num_labels": 1})
+    last_err: Exception | None = None
+    rm = None
+    for kwargs in attempts:
+        try:
+            rm = AutoModelForSequenceClassification.from_pretrained(name, **kwargs).eval()
+            break
+        except Exception as exc:  # OOM, missing bnb kernels, architecture without 4-bit
+            last_err = exc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    if rm is None:
+        raise RuntimeError(f"Could not load reward model {name}") from last_err
+    device = next(rm.parameters()).device
+
+    def score(prompt: str, answer: str) -> float:
+        text = _rm_conversation_text(tok, prompt, answer)
+        batch = tok(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
         with torch.no_grad():
-            return float(rm(**batch).logits[0][0])
+            logits = rm(**batch).logits
+        return float(logits.reshape(-1)[0])
 
     return score
 

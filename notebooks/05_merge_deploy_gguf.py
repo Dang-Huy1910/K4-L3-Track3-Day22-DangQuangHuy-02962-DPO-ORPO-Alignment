@@ -21,7 +21,10 @@ from pathlib import Path
 ROOT = next(p for p in (Path.cwd(), *Path.cwd().parents) if (p / "lab22" / "config.py").exists())
 sys.path.insert(0, str(ROOT))
 
-import unsloth  # noqa: F401
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
 import torch
 
 from lab22 import config as C

@@ -12,46 +12,97 @@ from pathlib import Path
 from . import config as C
 
 
-def load_model(name: str | Path, max_len: int = C.MAX_LEN, load_in_4bit: bool = True):
-    from unsloth import FastLanguageModel
+def _ensure_pad_token(tokenizer, name: str | Path):
+    """Qwen3 has a dedicated pad token; smaller Qwen2.5 checkpoints reuse EOS."""
+    if tokenizer.pad_token is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
+        return tokenizer
+    vocab = tokenizer.get_vocab()
+    for candidate in ("<|vision_pad|>", "<|endoftext|>", "<pad>", "[PAD]"):
+        if candidate in vocab and vocab[candidate] != tokenizer.eos_token_id:
+            tokenizer.pad_token = candidate
+            return tokenizer
+    if tokenizer.unk_token is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+        return tokenizer
+    raise ValueError(f"{name}: tokenizer needs a pad token distinct from EOS")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=str(name),
-        max_seq_length=max_len,
-        dtype=None,
-        load_in_4bit=load_in_4bit,
-    )
-    # Qwen3 ships a dedicated pad token. Reusing EOS as pad would mask the
-    # end-of-turn token out of the loss and teach the model never to stop.
-    if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
-        if "<|vision_pad|>" not in tokenizer.get_vocab():
-            raise ValueError(f"{name}: tokenizer needs a pad token distinct from EOS")
-        tokenizer.pad_token = "<|vision_pad|>"
+
+def load_model(name: str | Path, max_len: int = C.MAX_LEN, load_in_4bit: bool | None = None):
+    load_in_4bit = C.LOAD_IN_4BIT if load_in_4bit is None else load_in_4bit
+    try:
+        from unsloth import FastLanguageModel
+
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=str(name),
+            max_seq_length=max_len,
+            dtype=None,
+            load_in_4bit=load_in_4bit,
+        )
+    except ImportError:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+        tokenizer = AutoTokenizer.from_pretrained(str(name), trust_remote_code=True)
+        kwargs: dict = {"trust_remote_code": True}
+        if torch.cuda.is_available():
+            kwargs["device_map"] = "auto"
+            if load_in_4bit:
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+            else:
+                kwargs["dtype"] = torch.float16
+        model = AutoModelForCausalLM.from_pretrained(str(name), **kwargs)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+    tokenizer = _ensure_pad_token(tokenizer, name)
     return model, tokenizer
 
 
 def add_lora(model, r: int = C.LORA_R, alpha: int = C.LORA_ALPHA):
-    from unsloth import FastLanguageModel
+    try:
+        from unsloth import FastLanguageModel
 
-    return FastLanguageModel.get_peft_model(
-        model,
-        r=r,
-        lora_alpha=alpha,
-        lora_dropout=0.0,
-        bias="none",
-        target_modules=C.LORA_TARGETS,
-        use_gradient_checkpointing="unsloth",
-        random_state=C.SEED,
-    )
+        return FastLanguageModel.get_peft_model(
+            model,
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=C.LORA_TARGETS,
+            use_gradient_checkpointing="unsloth",
+            random_state=C.SEED,
+        )
+    except ImportError:
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        cfg = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=C.LORA_TARGETS,
+        )
+        return get_peft_model(model, cfg)
 
 
 def chat_text(tokenizer, messages: list[dict], add_generation_prompt: bool = True) -> str:
-    return tokenizer.apply_chat_template(
-        messages,
+    kwargs = dict(
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
         **C.CHAT_TEMPLATE_KWARGS,
     )
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def generate(
@@ -59,34 +110,108 @@ def generate(
     tokenizer,
     prompts: list[str],
     max_new_tokens: int = C.GEN_MAX_NEW_TOKENS,
-    batch_size: int = 8,
+    batch_size: int | None = None,
 ) -> list[str]:
     """Greedy, batched generation for single-turn user prompts."""
     import torch
-    from unsloth import FastLanguageModel
 
-    FastLanguageModel.for_inference(model)
+    try:
+        from unsloth import FastLanguageModel
+
+        FastLanguageModel.for_inference(model)
+    except ImportError:
+        model.eval()
+        if hasattr(model, "config"):
+            model.config.use_cache = True
+
+    if batch_size is None:
+        vram = torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+        batch_size = 1 if vram < 8 * (1024**3) else 8
+
     old_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
+    device = next(model.parameters()).device
     outputs: list[str] = []
     try:
         for start in range(0, len(prompts), batch_size):
             batch = prompts[start : start + batch_size]
             texts = [chat_text(tokenizer, [{"role": "user", "content": p}]) for p in batch]
             # The template already contains the special tokens.
-            enc = tokenizer(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
+            enc = tokenizer(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
             with torch.no_grad():
                 out = model.generate(
                     **enc,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
+                    use_cache=True,
                 )
             new_tokens = out[:, enc["input_ids"].shape[1] :]
             outputs.extend(t.strip() for t in tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
     finally:
         tokenizer.padding_side = old_side
     return outputs
+
+
+def train_on_responses_only(trainer, instruction_part: str, response_part: str):
+    """Mask prompt tokens so SFT loss is only on the assistant reply."""
+    try:
+        from unsloth.chat_templates import train_on_responses_only as _unsloth_mask
+
+        return _unsloth_mask(trainer, instruction_part=instruction_part, response_part=response_part)
+    except ImportError:
+        pass
+
+    if "labels" in getattr(trainer.train_dataset, "column_names", []):
+        # TRL already tokenized and built labels; remapping on a 4 GB card
+        # just burns RAM and can desync the collator.
+        return trainer
+    tokenizer = trainer.processing_class
+    max_len = getattr(trainer.args, "max_length", None) or C.MAX_LEN
+    resp_ids = tokenizer.encode(response_part, add_special_tokens=False)
+
+    def find_sublist(haystack: list[int], needle: list[int]) -> int | None:
+        n, m = len(haystack), len(needle)
+        if m == 0 or m > n:
+            return None
+        for i in range(n - m, -1, -1):
+            if haystack[i : i + m] == needle:
+                return i
+        return None
+
+    def tokenize_row(row):
+        ids = tokenizer(
+            row["text"],
+            truncation=True,
+            max_length=max_len,
+            add_special_tokens=False,
+        )["input_ids"]
+        labels = list(ids)
+        idx = find_sublist(ids, resp_ids)
+        if idx is not None:
+            cut = idx + len(resp_ids)
+            labels = [-100] * cut + labels[cut:]
+        return {"input_ids": ids, "labels": labels, "attention_mask": [1] * len(ids)}
+
+    ds = trainer.train_dataset
+    trainer.train_dataset = ds.map(tokenize_row, remove_columns=ds.column_names)
+    if hasattr(trainer.args, "dataset_text_field"):
+        trainer.args.dataset_text_field = None
+    return trainer
+
+
+def save_merged(model, tokenizer, path: Path):
+    """Write a 16-bit merged checkpoint (Unsloth or PEFT)."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if hasattr(model, "save_pretrained_merged"):
+        model.save_pretrained_merged(str(path), tokenizer, save_method="merged_16bit")
+        return
+    from peft import PeftModel
+
+    to_save = model.merge_and_unload() if isinstance(model, PeftModel) else model
+    to_save.save_pretrained(str(path))
+    tokenizer.save_pretrained(str(path))
 
 
 def cleanup() -> None:
@@ -101,8 +226,16 @@ def cleanup() -> None:
 def precision_flags() -> dict:
     import torch
 
-    bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    return {"bf16": bf16, "fp16": torch.cuda.is_available() and not bf16}
+    if not torch.cuda.is_available():
+        return {}
+    bf16 = torch.cuda.is_bf16_supported()
+    return {"bf16": bf16, "fp16": not bf16}
+
+
+def trainer_optim() -> str:
+    import torch
+
+    return "adamw_8bit" if torch.cuda.is_available() else "adamw_torch"
 
 
 def dpo_config(output_dir: str | Path, loss_type: list[str] | None = None, **overrides):
@@ -132,9 +265,11 @@ def dpo_config(output_dir: str | Path, loss_type: list[str] | None = None, **ove
         eval_strategy="steps",
         eval_steps=25,
         save_strategy="no",
-        optim="adamw_8bit",
+        optim=trainer_optim(),
         seed=C.SEED,
         report_to="none",
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,
         **precision_flags(),
     )
     params.update(overrides)

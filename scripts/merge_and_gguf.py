@@ -25,7 +25,10 @@ def main() -> int:
     parser.add_argument("--quant", action="append", default=None, help="repeatable; default q4_k_m")
     args = parser.parse_args()
 
-    import unsloth  # noqa: F401
+    try:
+        import unsloth  # noqa: F401
+    except ImportError:
+        pass
 
     from lab22 import config as C
     from lab22 import modeling as MD
